@@ -63,7 +63,7 @@ def embed_data(image_array, timestamp_str: str, width: int, height: int):
     
     coords = get_border_coordinates(height, width)
     if len(bits) > len(coords):
-        raise ValueError("Image is too small to hold the steganography data on its top/left borders.")
+        raise ValueError("Image is too small...")
         
     img_copy = image_array.copy()
     
