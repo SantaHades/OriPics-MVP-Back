@@ -45,8 +45,8 @@ def embed_data(image_array, timestamp_str: str, width: int, height: int):
     pre_payload += height.to_bytes(4, byteorder='big')
     pre_payload += inner_hash
     
-    # Calculate final hash over the entire pre-payload
-    final_hash = hashlib.sha256(pre_payload).digest()
+    # Calculate final hash over the entire pre-payload + salt
+    final_hash = hashlib.sha256(pre_payload + b"scipiro").digest()
     
     # The actual payload embedded
     payload = bytearray(MAGIC_BYTES)
@@ -122,7 +122,7 @@ def extract_data(image_array):
     # Reconstruct pre-payload to validate
     current_inner_hash = compute_inner_hash(image_array)
     pre_payload = payload_bytes[:31] + current_inner_hash
-    expected_final_hash = hashlib.sha256(pre_payload).digest()
+    expected_final_hash = hashlib.sha256(pre_payload + b"scipiro").digest()
     
     match = (extracted_final_hash == expected_final_hash)
     
