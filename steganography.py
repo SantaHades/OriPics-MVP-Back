@@ -26,18 +26,58 @@ def compute_inner_hash(image_array):
     inner_bytes = np.ascontiguousarray(inner_image).tobytes()
     return hashlib.sha256(inner_bytes).digest()
 
+def get_masked_border_bytes(image_array, coords, bits_count):
+    """
+    Returns bytes of the 4 borders (Top, Bottom, Left, Right) 
+    with bits at `coords[:bits_count]` masked (B-channel LSB set to 0).
+    """
+    h, w, _ = image_array.shape
+    # Work on a copy of the border pixels to avoid full image copy if possible, 
+    # but for simplicity and correctness, we'll use a targeted masking approach.
+    
+    # 1. Identify all border pixels
+    # Top: y=0, Bottom: y=h-1, Left: x=0, Right: x=w-1
+    # To be deterministic, we extract them in a fixed order.
+    
+    # Apply masking to a copy of the required pixels
+    # For efficiency, we only need to mask the Top/Left bits used for storage
+    temp_borders = {
+        "top": image_array[0, :, :].copy(),
+        "bottom": image_array[h-1, :, :].copy(),
+        "left": image_array[1:h-1, 0, :].copy(),
+        "right": image_array[1:h-1, w-1, :].copy()
+    }
+    
+    # Masking logic
+    for i in range(bits_count):
+        y, x = coords[i]
+        if y == 0: # Top border
+            temp_borders["top"][x, 2] &= ~1
+        elif x == 0: # Left border
+            # Note: temp_borders["left"] starts from y=1
+            temp_borders["left"][y-1, 2] &= ~1
+            
+    return (temp_borders["top"].tobytes() + 
+            temp_borders["bottom"].tobytes() + 
+            temp_borders["left"].tobytes() + 
+            temp_borders["right"].tobytes())
+
 def embed_data(image_array, timestamp_str: str, width: int, height: int):
     """
-    Embeds metadata and inner image hash into the B channel LSBs of the top/left border.
-    timestamp_str must be exactly 15 characters (YYMMDDHHmmssSSS).
-    Returns the modified image_array.
+    Embeds metadata and hashes into the B channel LSBs of the top/left border.
+    Covers 100% of pixels by including inner hash and border bytes.
     """
     if len(timestamp_str) != 15:
         raise ValueError(f"Timestamp must be 15 chars, got {len(timestamp_str)}")
         
+    coords = get_border_coordinates(height, width)
+    bits_count = DATA_LENGTH * 8
+    if bits_count > len(coords):
+        raise ValueError("Image is too small...")
+
     inner_hash = compute_inner_hash(image_array)
     
-    # Pack pre-payload
+    # 1. Pack pre-payload (Metadata + Inner Hash)
     pre_payload = bytearray(MAGIC_BYTES)
     pre_payload += DATA_LENGTH.to_bytes(4, byteorder='big')
     pre_payload += timestamp_str.encode('ascii')
@@ -45,8 +85,11 @@ def embed_data(image_array, timestamp_str: str, width: int, height: int):
     pre_payload += height.to_bytes(4, byteorder='big')
     pre_payload += inner_hash
     
-    # Calculate final hash over the entire pre-payload + salt
-    final_hash = hashlib.sha256(pre_payload + b"scipiro").digest()
+    # 2. Get masked border data to cover the "outside" of the inner hash
+    border_bytes = get_masked_border_bytes(image_array, coords, bits_count)
+    
+    # 3. Calculate final hash over Metadata + Inner Hash + Border Data + salt
+    final_hash = hashlib.sha256(pre_payload + border_bytes + b"scipiro").digest()
     
     # The actual payload embedded
     payload = bytearray(MAGIC_BYTES)
@@ -56,73 +99,56 @@ def embed_data(image_array, timestamp_str: str, width: int, height: int):
     payload += height.to_bytes(4, byteorder='big')
     payload += final_hash
     
-    assert len(payload) == DATA_LENGTH, f"Payload length mismatch: {len(payload)}"
-    
     # Convert payload to bits
     bits = np.unpackbits(np.frombuffer(payload, dtype=np.uint8))
     
-    coords = get_border_coordinates(height, width)
-    if len(bits) > len(coords):
-        raise ValueError("Image is too small...")
-        
     img_copy = image_array.copy()
-    
-    # Embed in Blue channel (index 2), assuming image_array is at least RGB
     for i, bit in enumerate(bits):
         y, x = coords[i]
         pixel_val = img_copy[y, x, 2]
-        # Clear LSB and set to `bit`
         img_copy[y, x, 2] = (pixel_val & ~1) | bit
         
     return img_copy
 
 def extract_data(image_array):
     """
-    Extracts embedded data from the B channel LSBs of the top/left border.
-    Returns a dict { match: bool, timestamp: str, width: int, height: int } or None if no magic found.
+    Extracts embedded data and validates 100% pixel integrity.
     """
     height, width, _ = image_array.shape
     coords = get_border_coordinates(height, width)
+    bits_count = DATA_LENGTH * 8
     
-    if len(coords) < DATA_LENGTH * 8:
-        return None # Image too small
+    if len(coords) < bits_count:
+        return None
         
-    # Read first 8 bytes (64 bits) to check Magic and Length
-    first_64_bits = []
-    for i in range(64):
-        y, x = coords[i]
-        b_bit = image_array[y, x, 2] & 1
-        first_64_bits.append(b_bit)
-        
-    first_8_bytes = np.packbits(first_64_bits).tobytes()
-    magic = first_8_bytes[:4]
-    
-    if magic != MAGIC_BYTES:
-        return None  # No valid signature
-        
-    length = int.from_bytes(first_8_bytes[4:8], byteorder='big')
-    if length != DATA_LENGTH:
-        return None  # Tampered or invalid length
-        
-    # Read all payload bits
-    total_bits_to_read = DATA_LENGTH * 8
+    # Read payload bits
     payload_bits = []
-    for i in range(total_bits_to_read):
+    for i in range(bits_count):
         y, x = coords[i]
         b_bit = image_array[y, x, 2] & 1
         payload_bits.append(b_bit)
         
     payload_bytes = np.packbits(payload_bits).tobytes()
     
+    # Validate Magic
+    if payload_bytes[:4] != MAGIC_BYTES:
+        return None
+    if int.from_bytes(payload_bytes[4:8], byteorder='big') != DATA_LENGTH:
+        return None
+        
     timestamp_str = payload_bytes[8:23].decode('ascii')
     orig_w = int.from_bytes(payload_bytes[23:27], byteorder='big')
     orig_h = int.from_bytes(payload_bytes[27:31], byteorder='big')
     extracted_final_hash = payload_bytes[31:63]
     
-    # Reconstruct pre-payload to validate
+    # Validation
     current_inner_hash = compute_inner_hash(image_array)
+    # Reconstruct pre-payload
     pre_payload = payload_bytes[:31] + current_inner_hash
-    expected_final_hash = hashlib.sha256(pre_payload + b"scipiro").digest()
+    # Get masked border bytes of the CURRENT image
+    border_bytes = get_masked_border_bytes(image_array, coords, bits_count)
+    
+    expected_final_hash = hashlib.sha256(pre_payload + border_bytes + b"scipiro").digest()
     
     match = (extracted_final_hash == expected_final_hash)
     
