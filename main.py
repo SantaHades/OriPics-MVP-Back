@@ -47,7 +47,7 @@ async def process_image(file: UploadFile = File(...)):
             
         # 2. Not stamped, so we stamp it
         # Format timestamp to 15 chars: YYMMDDHHmmssSSS
-        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))) # KST
+        now = datetime.datetime.now(datetime.timezone.utc)  # UTC (World Standard Time)
         # SSS requires manual extraction of microseconds
         timestamp_str = now.strftime("%y%m%d%H%M%S") + f"{now.microsecond // 1000:03d}"
         
