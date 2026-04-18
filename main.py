@@ -17,13 +17,22 @@ app.add_middleware(
 )
 
 # --- Persistence & Storage Setup ---
-BASE_DIR = Path("/Users/ress/Documents/0000/02.oripics-MVP/backend")
-STORAGE_DIR = BASE_DIR / "oripics_link"
-DATA_DIR = BASE_DIR / "data"
+# Default to current script directory for local development
+CURRENT_DIR = Path(__file__).parent
+# Check for Hugging Face persistent storage mount point
+HF_DATA_DIR = Path("/data")
+
+if HF_DATA_DIR.exists():
+    BASE_STORAGE_DIR = HF_DATA_DIR
+else:
+    BASE_STORAGE_DIR = CURRENT_DIR
+
+STORAGE_DIR = BASE_STORAGE_DIR / "oripics_link"
+DATA_DIR = BASE_STORAGE_DIR / "data"
 COUNTER_FILE = DATA_DIR / "counter.json"
 
-STORAGE_DIR.mkdir(exist_ok=True)
-DATA_DIR.mkdir(exist_ok=True)
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 class DailyCounter:
     def __init__(self):
