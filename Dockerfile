@@ -18,4 +18,4 @@ USER user
 # Hugging Face Spaces가 앱 라우팅을 위해 바라보는 기본 포트
 EXPOSE 7860
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}
