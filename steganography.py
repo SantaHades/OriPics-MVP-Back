@@ -52,10 +52,10 @@ def get_masked_border_bytes(image_array, coords, bits_count):
     for i in range(bits_count):
         y, x = coords[i]
         if y == 0: # Top border
-            temp_borders["top"][x, 2] &= ~1
+            temp_borders["top"][x, 2] &= 0xFE
         elif x == 0: # Left border
             # Note: temp_borders["left"] starts from y=1
-            temp_borders["left"][y-1, 2] &= ~1
+            temp_borders["left"][y-1, 2] &= 0xFE
             
     return (temp_borders["top"].tobytes() + 
             temp_borders["bottom"].tobytes() + 
@@ -106,7 +106,7 @@ def embed_data(image_array, timestamp_str: str, width: int, height: int):
     for i, bit in enumerate(bits):
         y, x = coords[i]
         pixel_val = img_copy[y, x, 2]
-        img_copy[y, x, 2] = (pixel_val & ~1) | bit
+        img_copy[y, x, 2] = (pixel_val & 0xFE) | bit
         
     return img_copy
 
