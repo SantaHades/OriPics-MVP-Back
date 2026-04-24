@@ -20,11 +20,15 @@ app = FastAPI(title="OriPics MVP Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://oripics-mvp.vercel.app", # 여기에 실제 Vercel 주소를 추가하세요.
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # --- Persistence & Storage Setup ---
 # Default to current script directory for local development
