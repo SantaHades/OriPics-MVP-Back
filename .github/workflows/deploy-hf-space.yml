@@ -18,6 +18,5 @@ jobs:
       - name: Push to Hugging Face Hub
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        # 아래 주소의 [USERNAME]과 [SPACE_NAME] 부분을 실제 허깅페이스 정보로 변경하세요.
-        # 예: https://SantaHades:$HF_TOKEN@huggingface.co/spaces/SantaHades/OriPics-MVP-Back
-        run: git push --force https://SantaHades:$HF_TOKEN@huggingface.co/spaces/SantaHades/OriPics-MVP-Back main
+        run: git push --force https://VitaminD7:$HF_TOKEN@huggingface.co/spaces/VitaminD7/OriPics-MVP-Back main
+
