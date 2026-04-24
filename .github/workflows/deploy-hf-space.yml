@@ -1,0 +1,23 @@
+name: Sync to Hugging Face Hub
+
+on:
+  push:
+    branches: [main]
+  # Actions 탭에서 수동으로 실행할 수 있도록 허용
+  workflow_dispatch:
+
+jobs:
+  sync-to-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          lfs: true
+      
+      - name: Push to Hugging Face Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        # 아래 주소의 [USERNAME]과 [SPACE_NAME] 부분을 실제 허깅페이스 정보로 변경하세요.
+        # 예: https://SantaHades:$HF_TOKEN@huggingface.co/spaces/SantaHades/OriPics-MVP-Back
+        run: git push --force https://SantaHades:$HF_TOKEN@huggingface.co/spaces/SantaHades/OriPics-MVP-Back main
