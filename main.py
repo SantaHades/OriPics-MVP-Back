@@ -22,7 +22,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "https://oripics-mvp.vercel.app", # 여기에 실제 Vercel 주소를 추가하세요.
+        "https://ori-pics-mvp-front.vercel.app", # 여기에 실제 Vercel 주소를 추가하세요.
     ],
     allow_credentials=True,
     allow_methods=["*"],
