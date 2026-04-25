@@ -16,9 +16,15 @@ from pydantic import BaseModel
 
 from steganography import embed_data, extract_data, compute_inner_hash
 
+# --- Persistence & Storage Setup ---
 app = FastAPI(title="OriPics MVP Backend")
 
+@app.get("/")
+async def root():
+    return {"status": "running", "message": "OriPics Backend is active"}
+
 app.add_middleware(
+
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
