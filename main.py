@@ -16,7 +16,7 @@ except ImportError:
     pass
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -165,7 +165,8 @@ async def process_image(file: UploadFile = File(...)):
         
     try:
         content = await file.read()
-        image = Image.open(BytesIO(content)).convert("RGBA")
+        image = Image.open(BytesIO(content))
+        image = ImageOps.exif_transpose(image).convert("RGBA")
         image_array = np.array(image)
         height, width, _ = image_array.shape
         
