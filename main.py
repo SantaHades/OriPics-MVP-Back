@@ -159,8 +159,9 @@ class LinkCreateRequest(BaseModel):
 # --- API Endpoints ---
 @app.post("/api/process")
 async def process_image(file: UploadFile = File(...)):
-    if file.content_type not in ["image/png"]:
-        raise HTTPException(status_code=400, detail="Only PNG images are supported.")
+    SUPPORTED_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp", "image/tiff", "image/gif"]
+    if file.content_type not in SUPPORTED_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported image format. Supported: PNG, JPG, WebP, BMP, TIFF, GIF")
         
     try:
         content = await file.read()
