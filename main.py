@@ -157,10 +157,11 @@ async def startup_event():
 
 class LinkCreateRequest(BaseModel):
     session_id: str
+    upload_type: str = "F"
 
 # --- API Endpoints ---
 @app.post("/api/process")
-async def process_image(file: UploadFile = File(...)):
+async def process_image(file: UploadFile = File(...), upload_type: str = "F"):
     SUPPORTED_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp", "image/tiff", "image/gif"]
     if file.content_type not in SUPPORTED_TYPES:
         raise HTTPException(status_code=400, detail=f"Unsupported image format. Supported: PNG, JPG, WebP, BMP, TIFF, GIF")
@@ -187,7 +188,9 @@ async def process_image(file: UploadFile = File(...)):
             
         # 2. Not stamped, so we stamp it
         now = datetime.datetime.now(datetime.timezone.utc)
-        timestamp_str = now.strftime("%y%m%d%H%M%S") + f"{now.microsecond // 1000:03d}"
+        # Prefix (1) + yymmddHHMMSS (12) + ms/10 (2) = 15 chars
+        prefix = upload_type if upload_type in ["F", "P", "C"] else "F"
+        timestamp_str = prefix + now.strftime("%y%m%d%H%M%S") + f"{now.microsecond // 10000:02d}"
         
         stamped_array = embed_data(image_array, timestamp_str, width, height)
         inner_hash = compute_inner_hash(stamped_array).hex()
@@ -238,12 +241,13 @@ async def create_link(req: LinkCreateRequest):
     img_bytes = data["image_data"]
     meta = data["metadata"]
     
-    # Generate ID
+    # Generate ID with prefix from metadata
     now = datetime.datetime.now(datetime.timezone.utc)
+    prefix = meta["timestamp"][0] if meta["timestamp"][0] in ["F", "P", "C"] else "F"
     ts_part = now.strftime("%y%m%d-%H%M%S")
     ms_part = f"{now.microsecond // 1000:03d}"
     count = daily_counter.get_next()
-    link_id = f"{ts_part}-{ms_part}{count}"
+    link_id = f"{prefix}{ts_part}-{ms_part}{count}"
     
     # Save to Supabase Storage or local fallback
     yy = now.strftime("%y")
