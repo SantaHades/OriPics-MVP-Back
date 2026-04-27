@@ -285,8 +285,14 @@ async def create_link(req: LinkCreateRequest):
 @app.get("/api/links/{link_id}")
 async def get_link_data(link_id: str):
     try:
-        yy = link_id[0:2]
-        mmdd = link_id[2:6]
+        # Handle optional prefix (F/P/C)
+        if link_id[0].isalpha():
+            yy = link_id[1:3]
+            mmdd = link_id[3:7]
+        else:
+            yy = link_id[0:2]
+            mmdd = link_id[2:6]
+            
         storage_path = f"{yy}{mmdd}/{link_id}.png"
         
         content = None
