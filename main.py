@@ -62,6 +62,8 @@ HF_DATA_DIR = Path("/data")
 
 if HF_DATA_DIR.exists():
     BASE_STORAGE_DIR = HF_DATA_DIR
+elif os.environ.get("SPACE_ID"):
+    BASE_STORAGE_DIR = Path("/tmp")
 else:
     BASE_STORAGE_DIR = CURRENT_DIR
 

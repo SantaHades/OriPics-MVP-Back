@@ -4,6 +4,7 @@ FROM python:3.11-slim
 RUN useradd -m -u 1000 user
 
 WORKDIR /code
+RUN chown -R user:user /code
 
 # 의존성 설치
 COPY --chown=user requirements.txt .
