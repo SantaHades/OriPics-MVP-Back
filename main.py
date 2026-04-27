@@ -8,15 +8,23 @@ import asyncio
 from io import BytesIO
 from pathlib import Path
 
+# Load .env for local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import numpy as np
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from supabase import create_client
 
 from steganography import embed_data, extract_data, compute_inner_hash
 
-# --- Persistence & Storage Setup ---
+# --- App Setup ---
 app = FastAPI(title="OriPics MVP Backend")
 
 @app.get("/")
@@ -24,7 +32,6 @@ async def root():
     return {"status": "running", "message": "OriPics Backend is active"}
 
 app.add_middleware(
-
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
@@ -37,11 +44,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Supabase Storage Setup ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+BUCKET_NAME = "oripics-proofs"
 
-# --- Persistence & Storage Setup ---
-# Default to current script directory for local development
+supabase_client = None
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    print(f"[Supabase] Connected to {SUPABASE_URL}")
+else:
+    print("[Supabase] WARNING: Missing SUPABASE_URL or SUPABASE_SERVICE_KEY. Falling back to local storage.")
+
+# --- Fallback: Local Storage (for development) ---
 CURRENT_DIR = Path(__file__).parent
-# Check for Hugging Face persistent storage mount point
 HF_DATA_DIR = Path("/data")
 
 if HF_DATA_DIR.exists():
@@ -77,7 +93,7 @@ class DailyCounter:
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
     def get_next(self):
-        self.load() # Refresh in case date changed
+        self.load()
         self.count += 1
         self.save()
         return self.count
@@ -85,11 +101,10 @@ class DailyCounter:
 daily_counter = DailyCounter()
 
 # In-memory cache for 3-minute temporary storage
-# session_id -> { image_bytes, metadata, expiry }
 temp_stamped_cache = {}
 
 async def cleanup_task():
-    """Background task to cleanup temp cache (3 mins) and old links (7 days)"""
+    """Background task to cleanup temp cache (3 mins) and old Supabase files (7 days)"""
     while True:
         # 1. Cleanup temp cache (3 mins)
         now = time.time()
@@ -97,22 +112,42 @@ async def cleanup_task():
         for sid in expired_sessions:
             del temp_stamped_cache[sid]
         
-        # 2. Cleanup old links (7 days)
-        # We walk through the directory structure oripics_link/YY/MMDD/HHmm/
-        seven_days_ago = now - (7 * 24 * 3600)
-        for root, dirs, files in os.walk(STORAGE_DIR, topdown=False):
-            for name in files:
-                file_path = Path(root) / name
-                if file_path.stat().st_mtime < seven_days_ago:
-                    try:
-                        file_path.unlink()
+        # 2. Cleanup old files (7 days) - Supabase Storage
+        if supabase_client:
+            try:
+                seven_days_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+                # List files and delete old ones
+                result = supabase_client.storage.from_(BUCKET_NAME).list()
+                if result:
+                    for folder in result:
+                        if folder.get("name"):
+                            # List files in date folders
+                            sub_files = supabase_client.storage.from_(BUCKET_NAME).list(folder["name"])
+                            if sub_files:
+                                for f in sub_files:
+                                    if f.get("created_at"):
+                                        created = datetime.datetime.fromisoformat(f["created_at"].replace("Z", "+00:00"))
+                                        if created < seven_days_ago:
+                                            file_path = f"{folder['name']}/{f['name']}"
+                                            supabase_client.storage.from_(BUCKET_NAME).remove([file_path])
+                                            print(f"[Cleanup] Deleted expired file: {file_path}")
+            except Exception as e:
+                print(f"[Cleanup] Supabase cleanup error: {e}")
+        else:
+            # Fallback: local filesystem cleanup
+            seven_days_ago = now - (7 * 24 * 3600)
+            for root, dirs, files in os.walk(STORAGE_DIR, topdown=False):
+                for name in files:
+                    file_path = Path(root) / name
+                    if file_path.stat().st_mtime < seven_days_ago:
+                        try:
+                            file_path.unlink()
+                        except: pass
+                if not os.listdir(root) and root != str(STORAGE_DIR):
+                    try: os.rmdir(root)
                     except: pass
-            # Clean empty dirs
-            if not os.listdir(root) and root != str(STORAGE_DIR):
-                try: os.rmdir(root)
-                except: pass
         
-        await asyncio.sleep(60) # Run every minute
+        await asyncio.sleep(3600)  # Run every hour (Supabase doesn't need minute-level checks)
 
 @app.on_event("startup")
 async def startup_event():
@@ -136,7 +171,6 @@ async def process_image(file: UploadFile = File(...)):
         # 1. Check if already stamped
         existing_data = extract_data(image_array)
         if existing_data is not None:
-            # It was already stamped
             return {
                 "status": "verified",
                 "match": existing_data["match"],
@@ -148,19 +182,12 @@ async def process_image(file: UploadFile = File(...)):
             }
             
         # 2. Not stamped, so we stamp it
-        # Format timestamp to 15 chars: YYMMDDHHmmssSSS
-        now = datetime.datetime.now(datetime.timezone.utc)  # UTC (World Standard Time)
-        # SSS requires manual extraction of microseconds
+        now = datetime.datetime.now(datetime.timezone.utc)
         timestamp_str = now.strftime("%y%m%d%H%M%S") + f"{now.microsecond // 1000:03d}"
         
         stamped_array = embed_data(image_array, timestamp_str, width, height)
-        
-        # Calculate the hash to return to user (for info purposes, not embedded directly as hex)
-        # We compute inner hash again to return as hex just for the UI
         inner_hash = compute_inner_hash(stamped_array).hex()
         
-        # Convert back to PIL Image
-        # If original was RGB, convert back? We converted to RGBA to be safe.
         stamped_image = Image.fromarray(stamped_array, mode="RGBA")
         
         output_buffer = BytesIO()
@@ -180,7 +207,7 @@ async def process_image(file: UploadFile = File(...)):
                 "height": height,
                 "hash": inner_hash
             },
-            "expiry": time.time() + 180 # 3 minutes
+            "expiry": time.time() + 180
         }
         
         return {
@@ -207,27 +234,39 @@ async def create_link(req: LinkCreateRequest):
     img_bytes = data["image_data"]
     meta = data["metadata"]
     
-    # Generate ID: yymmdd-hhmmss-SSS + Counter
+    # Generate ID
     now = datetime.datetime.now(datetime.timezone.utc)
-    # The user example was 260418... SSS needs to be millisecond
     ts_part = now.strftime("%y%m%d-%H%M%S")
     ms_part = f"{now.microsecond // 1000:03d}"
     count = daily_counter.get_next()
     link_id = f"{ts_part}-{ms_part}{count}"
     
-    # Path: oripics_link/YY/MMDD/HHmm/ID.png
+    # Save to Supabase Storage or local fallback
     yy = now.strftime("%y")
     mmdd = now.strftime("%m%d")
-    hhmm = now.strftime("%H%M")
+    storage_path = f"{yy}{mmdd}/{link_id}.png"
     
-    save_dir = STORAGE_DIR / yy / mmdd / hhmm
-    save_dir.mkdir(parents=True, exist_ok=True)
-    file_path = save_dir / f"{link_id}.png"
+    if supabase_client:
+        try:
+            supabase_client.storage.from_(BUCKET_NAME).upload(
+                path=storage_path,
+                file=img_bytes,
+                file_options={"content-type": "image/png"}
+            )
+            print(f"[Supabase] Uploaded: {storage_path}")
+        except Exception as e:
+            print(f"[Supabase] Upload error: {e}")
+            raise HTTPException(status_code=500, detail=f"Storage upload failed: {str(e)}")
+    else:
+        # Fallback: local file storage
+        hhmm = now.strftime("%H%M")
+        save_dir = STORAGE_DIR / yy / mmdd / hhmm
+        save_dir.mkdir(parents=True, exist_ok=True)
+        file_path = save_dir / f"{link_id}.png"
+        with open(file_path, "wb") as f:
+            f.write(img_bytes)
     
-    with open(file_path, "wb") as f:
-        f.write(img_bytes)
-        
-    # Clean up temp cache early as it's now permanent
+    # Clean up temp cache
     del temp_stamped_cache[req.session_id]
     
     return {
@@ -237,33 +276,41 @@ async def create_link(req: LinkCreateRequest):
 
 @app.get("/api/links/{link_id}")
 async def get_link_data(link_id: str):
-    # Find the file in the directory structure
-    # Since link_id starts with YYMMDD, we can narrow it down
-    # Format: 260418-175959-7371
     try:
         yy = link_id[0:2]
         mmdd = link_id[2:6]
-        # We don't have hhmm in the ID exactly, but we can search for it
-        # Actually, if we just search for the filename ID.png within STORAGE_DIR/yy/mmdd/
-        search_root = STORAGE_DIR / yy / mmdd
-        if not search_root.exists():
-            raise HTTPException(status_code=404, detail="Link not found (Date mismatch)")
-            
-        target_file = None
-        for root, dirs, files in os.walk(search_root):
-            if f"{link_id}.png" in files:
-                target_file = Path(root) / f"{link_id}.png"
-                break
+        storage_path = f"{yy}{mmdd}/{link_id}.png"
         
-        if not target_file:
-            raise HTTPException(status_code=404, detail="Link not found")
+        content = None
+        
+        # Try Supabase Storage first
+        if supabase_client:
+            try:
+                result = supabase_client.storage.from_(BUCKET_NAME).download(storage_path)
+                if result:
+                    content = result
+            except Exception as e:
+                print(f"[Supabase] Download error for {storage_path}: {e}")
+        
+        # Fallback: local file storage
+        if content is None:
+            search_root = STORAGE_DIR / yy / mmdd
+            if not search_root.exists():
+                raise HTTPException(status_code=404, detail="Link not found")
+                
+            target_file = None
+            for root, dirs, files in os.walk(search_root):
+                if f"{link_id}.png" in files:
+                    target_file = Path(root) / f"{link_id}.png"
+                    break
             
-        with open(target_file, "rb") as f:
-            content = f.read()
-            
-        # Re-extract transparency to get metadata if needed, 
-        # but the user just wants to view the page. 
-        # We return base64 and basic info.
+            if not target_file:
+                raise HTTPException(status_code=404, detail="Link not found")
+                
+            with open(target_file, "rb") as f:
+                content = f.read()
+        
+        # Extract metadata from image
         image = Image.open(BytesIO(content))
         image_array = np.array(image)
         extract = extract_data(image_array)
@@ -278,5 +325,7 @@ async def get_link_data(link_id: str):
                 "height": extract["height"]
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
