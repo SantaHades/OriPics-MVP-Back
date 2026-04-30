@@ -1,35 +1,27 @@
 import base64
 import datetime
-import uuid
 import json
 import os
 import time
 import asyncio
-from io import BytesIO
 from pathlib import Path
 
-# Load .env for local development
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-import numpy as np
-from PIL import Image, ImageOps
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import jwt
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from supabase import create_client
 
-from steganography import embed_data, extract_data, compute_inner_hash
+from stamp import v2 as stamp_v2
+from stamp.common import META_LENGTH, UPLOAD_TYPE_PREFIXES
 
-# --- App Setup ---
-app = FastAPI(title="OriPics MVP Backend")
-
-@app.get("/")
-async def root():
-    return {"status": "running", "message": "OriPics Backend is active"}
+app = FastAPI(title="OriPics MVP Backend v2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,19 +36,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Supabase Storage Setup ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 BUCKET_NAME = "oripics-proofs"
+JWT_SECRET = os.environ.get("ORIPICS_JWT_SECRET", "")
+CURRENT_SALT_ID = int(os.environ.get("ORIPICS_CURRENT_SALT_ID", "1"))
+CURRENT_VERSION = int(os.environ.get("ORIPICS_CURRENT_VERSION", "2"))
+
+JWT_TTL_SECONDS = 300
+SIGNED_UPLOAD_TTL_SECONDS = 60
 
 supabase_client = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
     supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     print(f"[Supabase] Connected to {SUPABASE_URL}")
 else:
-    print("[Supabase] WARNING: Missing SUPABASE_URL or SUPABASE_SERVICE_KEY. Falling back to local storage.")
+    print("[Supabase] WARNING: missing SUPABASE_URL or SUPABASE_SERVICE_KEY")
 
-# --- Fallback: Local Storage (for development) ---
+if not JWT_SECRET:
+    print("[Config] WARNING: ORIPICS_JWT_SECRET is not set")
+
+
+def get_salt(salt_id: int) -> bytes:
+    env_key = f"ORIPICS_SALT_V2_{salt_id:03d}"
+    salt_hex = os.environ.get(env_key)
+    if not salt_hex:
+        raise HTTPException(status_code=400, detail=f"unknown_salt_id:{salt_id}")
+    try:
+        return bytes.fromhex(salt_hex)
+    except ValueError:
+        raise HTTPException(status_code=500, detail="malformed_salt")
+
+
 CURRENT_DIR = Path(__file__).parent
 HF_DATA_DIR = Path("/data")
 
@@ -67,297 +78,292 @@ elif os.environ.get("SPACE_ID"):
 else:
     BASE_STORAGE_DIR = CURRENT_DIR
 
-STORAGE_DIR = BASE_STORAGE_DIR / "oripics_link"
 DATA_DIR = BASE_STORAGE_DIR / "data"
 COUNTER_FILE = DATA_DIR / "counter.json"
-
-STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 
 class DailyCounter:
     def __init__(self):
+        self.count = 0
         self.load()
+
+    def _today(self):
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
     def load(self):
         if COUNTER_FILE.exists():
-            with open(COUNTER_FILE, "r") as f:
-                data = json.load(f)
-                if data.get("date") == self._get_today():
-                    self.count = data.get("count", 0)
-                    return
+            try:
+                with open(COUNTER_FILE, "r") as f:
+                    data = json.load(f)
+                    if data.get("date") == self._today():
+                        self.count = data.get("count", 0)
+                        return
+            except Exception:
+                pass
         self.count = 0
 
     def save(self):
-        with open(COUNTER_FILE, "w") as f:
-            json.dump({"date": self._get_today(), "count": self.count}, f)
+        try:
+            with open(COUNTER_FILE, "w") as f:
+                json.dump({"date": self._today(), "count": self.count}, f)
+        except Exception as e:
+            print(f"[Counter] save error: {e}")
 
-    def _get_today(self):
-        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-
-    def get_next(self):
+    def next(self) -> int:
         self.load()
         self.count += 1
         self.save()
         return self.count
 
+
 daily_counter = DailyCounter()
 
-# In-memory cache for 3-minute temporary storage
-temp_stamped_cache = {}
 
-async def cleanup_task():
-    """Background task to cleanup temp cache (3 mins) and old Supabase files (7 days)"""
-    while True:
-        # 1. Cleanup temp cache (3 mins)
-        now = time.time()
-        expired_sessions = [sid for sid, data in temp_stamped_cache.items() if data['expiry'] < now]
-        for sid in expired_sessions:
-            del temp_stamped_cache[sid]
-        
-        # 2. Cleanup old files (7 days) - Supabase Storage
-        if supabase_client:
-            try:
-                seven_days_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
-                # List files and delete old ones
-                result = supabase_client.storage.from_(BUCKET_NAME).list()
-                if result:
-                    for folder in result:
-                        if folder.get("name"):
-                            # List files in date folders
-                            sub_files = supabase_client.storage.from_(BUCKET_NAME).list(folder["name"])
-                            if sub_files:
-                                for f in sub_files:
-                                    if f.get("created_at"):
-                                        created = datetime.datetime.fromisoformat(f["created_at"].replace("Z", "+00:00"))
-                                        if created < seven_days_ago:
-                                            file_path = f"{folder['name']}/{f['name']}"
-                                            supabase_client.storage.from_(BUCKET_NAME).remove([file_path])
-                                            print(f"[Cleanup] Deleted expired file: {file_path}")
-            except Exception as e:
-                print(f"[Cleanup] Supabase cleanup error: {e}")
-        else:
-            # Fallback: local filesystem cleanup
-            seven_days_ago = now - (7 * 24 * 3600)
-            for root, dirs, files in os.walk(STORAGE_DIR, topdown=False):
-                for name in files:
-                    file_path = Path(root) / name
-                    if file_path.stat().st_mtime < seven_days_ago:
-                        try:
-                            file_path.unlink()
-                        except: pass
-                if not os.listdir(root) and root != str(STORAGE_DIR):
-                    try: os.rmdir(root)
-                    except: pass
-        
-        await asyncio.sleep(3600)  # Run every hour (Supabase doesn't need minute-level checks)
+HEX32_REGEX = r"^[0-9a-fA-F]{64}$"
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(cleanup_task())
 
-class LinkCreateRequest(BaseModel):
-    session_id: str
+class SignRequest(BaseModel):
+    inner_hash: str = Field(pattern=HEX32_REGEX)
+    border_hash: str = Field(pattern=HEX32_REGEX)
+    width: int = Field(gt=0, lt=2**32)
+    height: int = Field(gt=0, lt=2**32)
     upload_type: str = "F"
 
-# --- API Endpoints ---
-@app.post("/api/process")
-async def process_image(file: UploadFile = File(...), upload_type: str = "F"):
-    SUPPORTED_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp", "image/tiff", "image/gif"]
-    if file.content_type not in SUPPORTED_TYPES:
-        raise HTTPException(status_code=400, detail=f"Unsupported image format. Supported: PNG, JPG, WebP, BMP, TIFF, GIF")
-        
-    try:
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="empty_file")
-        try:
-            image = Image.open(BytesIO(content))
-            if hasattr(image, 'n_frames') and image.n_frames > 1:
-                image.seek(0)
-        except Exception:
-            raise HTTPException(status_code=400, detail="invalid_image")
-        try:
-            image = ImageOps.exif_transpose(image)
-        except Exception:
-            pass
-        image = image.convert("RGBA")
-        image_array = np.array(image)
-        height, width, _ = image_array.shape
-        
-        # 1. Check if already stamped
-        existing_data = extract_data(image_array)
-        if existing_data is not None:
-            return {
-                "status": "verified",
-                "match": existing_data["match"],
-                "metadata": {
-                    "timestamp": existing_data["timestamp"],
-                    "width": existing_data["width"],
-                    "height": existing_data["height"]
-                }
-            }
-            
-        # 2. Not stamped, so we stamp it
-        now = datetime.datetime.now(datetime.timezone.utc)
-        # Prefix (1) + yymmddHHMMSS (12) + ms/10 (2) = 15 chars
-        prefix = upload_type if upload_type in ["F", "P", "C"] else "F"
-        timestamp_str = prefix + now.strftime("%y%m%d%H%M%S") + f"{now.microsecond // 10000:02d}"
-        
-        stamped_array = embed_data(image_array, timestamp_str, width, height)
-        inner_hash = compute_inner_hash(stamped_array).hex()
-        
-        stamped_image = Image.fromarray(stamped_array, mode="RGBA")
-        
-        output_buffer = BytesIO()
-        stamped_image.save(output_buffer, format="PNG")
-        output_buffer.seek(0)
-        
-        base64_encoded = base64.b64encode(output_buffer.read()).decode("utf-8")
-        base64_png = f"data:image/png;base64,{base64_encoded}"
-        
-        # Store in temp cache for 3 mins
-        session_id = str(uuid.uuid4())
-        temp_stamped_cache[session_id] = {
-            "image_data": output_buffer.getvalue(),
-            "metadata": {
-                "timestamp": timestamp_str,
-                "width": width,
-                "height": height,
-                "hash": inner_hash
-            },
-            "expiry": time.time() + 180
-        }
-        
-        return {
-            "status": "stamped",
-            "image": base64_png,
-            "session_id": session_id,
-            "metadata": {
-                "timestamp": timestamp_str,
-                "width": width,
-                "height": height,
-                "hash": inner_hash
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except ValueError as e:
-        msg = str(e)
-        if "too small" in msg.lower():
-            raise HTTPException(status_code=400, detail="image_too_small")
-        raise HTTPException(status_code=400, detail=msg)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    @field_validator("upload_type")
+    @classmethod
+    def validate_upload_type(cls, v: str) -> str:
+        return v if v in UPLOAD_TYPE_PREFIXES else "F"
 
-@app.post("/api/links/create")
-async def create_link(req: LinkCreateRequest):
-    if req.session_id not in temp_stamped_cache:
-        raise HTTPException(status_code=404, detail="Session expired or not found. Please re-stamp within 3 minutes.")
-    
-    data = temp_stamped_cache[req.session_id]
-    img_bytes = data["image_data"]
-    meta = data["metadata"]
-    
-    # Generate ID with prefix from metadata
+
+class ConfirmRequest(BaseModel):
+    jwt_token: str
+
+
+class VerifyRequest(BaseModel):
+    meta_hex: str
+    inner_hash: str = Field(pattern=HEX32_REGEX)
+    border_hash: str = Field(pattern=HEX32_REGEX)
+    extracted_final_hash: str = Field(pattern=HEX32_REGEX)
+
+    @field_validator("meta_hex")
+    @classmethod
+    def validate_meta_hex(cls, v: str) -> str:
+        if len(v) != META_LENGTH * 2:
+            raise ValueError(f"meta_hex must be {META_LENGTH * 2} hex chars")
+        bytes.fromhex(v)
+        return v.lower()
+
+
+def make_link_id(prefix: str) -> tuple[str, datetime.datetime]:
     now = datetime.datetime.now(datetime.timezone.utc)
-    prefix = meta["timestamp"][0] if meta["timestamp"][0] in ["F", "P", "C"] else "F"
+    if prefix not in UPLOAD_TYPE_PREFIXES:
+        prefix = "F"
     ts_part = now.strftime("%y%m%d-%H%M%S")
     ms_part = f"{now.microsecond // 1000:03d}"
-    count = daily_counter.get_next()
-    link_id = f"{prefix}{ts_part}-{ms_part}{count}"
-    
-    # Save to Supabase Storage or local fallback
-    yy = now.strftime("%y")
-    mmdd = now.strftime("%m%d")
-    storage_path = f"{yy}{mmdd}/{link_id}.png"
-    
-    if supabase_client:
-        try:
-            supabase_client.storage.from_(BUCKET_NAME).upload(
-                path=storage_path,
-                file=img_bytes,
-                file_options={"content-type": "image/png"}
-            )
-            print(f"[Supabase] Uploaded: {storage_path}")
-        except Exception as e:
-            print(f"[Supabase] Upload error: {e}")
-            raise HTTPException(status_code=500, detail=f"Storage upload failed: {str(e)}")
-    else:
-        # Fallback: local file storage
-        hhmm = now.strftime("%H%M")
-        save_dir = STORAGE_DIR / yy / mmdd / hhmm
-        save_dir.mkdir(parents=True, exist_ok=True)
-        file_path = save_dir / f"{link_id}.png"
-        with open(file_path, "wb") as f:
-            f.write(img_bytes)
-    
-    # Clean up temp cache
-    del temp_stamped_cache[req.session_id]
-    
-    return {
+    count = daily_counter.next()
+    return f"{prefix}{ts_part}-{ms_part}{count}", now
+
+
+def storage_path_for(link_id: str, dt: datetime.datetime) -> str:
+    yy = dt.strftime("%y")
+    mmdd = dt.strftime("%m%d")
+    return f"{yy}{mmdd}/{link_id}.png"
+
+
+def issue_jwt(link_id: str, storage_path: str, timestamp_str: str) -> str:
+    now = int(time.time())
+    payload = {
+        "iat": now,
+        "exp": now + JWT_TTL_SECONDS,
+        "aud": "links/confirm",
         "link_id": link_id,
-        "metadata": meta
+        "storage_path": storage_path,
+        "timestamp": timestamp_str,
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def decode_jwt(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"], audience="links/confirm")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="jwt_expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="jwt_invalid")
+
+
+@app.get("/")
+async def root():
+    return {"status": "running", "service": "OriPics Backend v2"}
+
+
+@app.post("/api/sign")
+async def sign(req: SignRequest):
+    if not supabase_client:
+        raise HTTPException(status_code=503, detail="storage_unavailable")
+
+    salt_id = CURRENT_SALT_ID
+    salt = get_salt(salt_id)
+
+    timestamp_str = stamp_v2.make_timestamp(req.upload_type)
+    meta_bytes = stamp_v2.build_meta_bytes(salt_id, timestamp_str, req.width, req.height)
+    final_hash = stamp_v2.compute_final_hash(
+        salt,
+        meta_bytes,
+        bytes.fromhex(req.inner_hash),
+        bytes.fromhex(req.border_hash),
+    )
+
+    link_id, now = make_link_id(req.upload_type)
+    path = storage_path_for(link_id, now)
+
+    try:
+        signed = supabase_client.storage.from_(BUCKET_NAME).create_signed_upload_url(path)
+        signed_upload_url = signed.get("signed_url") if isinstance(signed, dict) else getattr(signed, "signed_url", None)
+        upload_token = signed.get("token") if isinstance(signed, dict) else getattr(signed, "token", None)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"signed_url_error:{e}")
+
+    token = issue_jwt(link_id, path, timestamp_str)
+
+    return {
+        "version": CURRENT_VERSION,
+        "salt_id": salt_id,
+        "timestamp": timestamp_str,
+        "meta_hex": meta_bytes.hex(),
+        "final_hash": final_hash.hex(),
+        "link_id": link_id,
+        "storage_path": path,
+        "signed_upload_url": signed_upload_url,
+        "upload_token": upload_token,
+        "jwt": token,
+        "jwt_ttl": JWT_TTL_SECONDS,
     }
 
-@app.get("/api/links/{link_id}")
-async def get_link_data(link_id: str):
+
+@app.post("/api/links/confirm")
+async def confirm(req: ConfirmRequest):
+    if not supabase_client:
+        raise HTTPException(status_code=503, detail="storage_unavailable")
+
+    claims = decode_jwt(req.jwt_token)
+    link_id = claims["link_id"]
+    storage_path = claims["storage_path"]
+
     try:
-        # Handle optional prefix (F/P/C)
-        if link_id[0].isalpha():
+        listing = supabase_client.storage.from_(BUCKET_NAME).list(
+            path=str(Path(storage_path).parent),
+            options={"search": Path(storage_path).name},
+        )
+        exists = any(item.get("name") == Path(storage_path).name for item in (listing or []))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"storage_check_error:{e}")
+
+    if not exists:
+        raise HTTPException(status_code=404, detail="upload_not_found")
+
+    return {
+        "link_id": link_id,
+        "timestamp": claims["timestamp"],
+        "storage_path": storage_path,
+    }
+
+
+@app.post("/api/verify")
+async def verify(req: VerifyRequest):
+    meta_bytes = bytes.fromhex(req.meta_hex)
+    try:
+        parsed = stamp_v2.parse_meta_bytes(meta_bytes)
+    except ValueError as e:
+        return {"match": False, "reason": str(e)}
+
+    try:
+        salt = get_salt(parsed["salt_id"])
+    except HTTPException as e:
+        return {"match": False, "reason": e.detail}
+
+    match = stamp_v2.verify_final_hash(
+        salt,
+        meta_bytes,
+        bytes.fromhex(req.inner_hash),
+        bytes.fromhex(req.border_hash),
+        bytes.fromhex(req.extracted_final_hash),
+    )
+
+    return {
+        "match": match,
+        "version": parsed["version"],
+        "metadata": {
+            "timestamp": parsed["timestamp"],
+            "width": parsed["width"],
+            "height": parsed["height"],
+        },
+    }
+
+
+@app.get("/api/links/{link_id}")
+async def get_link(link_id: str):
+    try:
+        if link_id and link_id[0].isalpha():
             yy = link_id[1:3]
             mmdd = link_id[3:7]
         else:
             yy = link_id[0:2]
             mmdd = link_id[2:6]
-            
-        storage_path = f"{yy}{mmdd}/{link_id}.png"
-        
-        content = None
-        
-        # Try Supabase Storage first
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_link_id")
+
+    storage_path = f"{yy}{mmdd}/{link_id}.png"
+
+    if not supabase_client:
+        raise HTTPException(status_code=503, detail="storage_unavailable")
+
+    try:
+        content = supabase_client.storage.from_(BUCKET_NAME).download(storage_path)
+    except Exception:
+        raise HTTPException(status_code=404, detail="link_not_found")
+
+    if not content:
+        raise HTTPException(status_code=404, detail="link_not_found")
+
+    base64_encoded = base64.b64encode(content).decode("utf-8")
+    return {
+        "image": f"data:image/png;base64,{base64_encoded}",
+        "storage_path": storage_path,
+    }
+
+
+async def cleanup_task():
+    while True:
         if supabase_client:
             try:
-                result = supabase_client.storage.from_(BUCKET_NAME).download(storage_path)
-                if result:
-                    content = result
+                seven_days_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+                folders = supabase_client.storage.from_(BUCKET_NAME).list()
+                if folders:
+                    for folder in folders:
+                        name = folder.get("name")
+                        if not name:
+                            continue
+                        files = supabase_client.storage.from_(BUCKET_NAME).list(name)
+                        if not files:
+                            continue
+                        for f in files:
+                            created = f.get("created_at")
+                            if not created:
+                                continue
+                            try:
+                                created_dt = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+                            except ValueError:
+                                continue
+                            if created_dt < seven_days_ago:
+                                supabase_client.storage.from_(BUCKET_NAME).remove([f"{name}/{f['name']}"])
+                                print(f"[Cleanup] removed {name}/{f['name']}")
             except Exception as e:
-                print(f"[Supabase] Download error for {storage_path}: {e}")
-        
-        # Fallback: local file storage
-        if content is None:
-            search_root = STORAGE_DIR / yy / mmdd
-            if not search_root.exists():
-                raise HTTPException(status_code=404, detail="Link not found")
-                
-            target_file = None
-            for root, dirs, files in os.walk(search_root):
-                if f"{link_id}.png" in files:
-                    target_file = Path(root) / f"{link_id}.png"
-                    break
-            
-            if not target_file:
-                raise HTTPException(status_code=404, detail="Link not found")
-                
-            with open(target_file, "rb") as f:
-                content = f.read()
-        
-        # Extract metadata from image
-        image = Image.open(BytesIO(content))
-        image_array = np.array(image)
-        extract = extract_data(image_array)
-        
-        base64_encoded = base64.b64encode(content).decode("utf-8")
-        
-        return {
-            "image": f"data:image/png;base64,{base64_encoded}",
-            "metadata": {
-                "timestamp": extract["timestamp"],
-                "width": extract["width"],
-                "height": extract["height"]
-            }
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
+                print(f"[Cleanup] error: {e}")
+        await asyncio.sleep(3600)
+
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(cleanup_task())

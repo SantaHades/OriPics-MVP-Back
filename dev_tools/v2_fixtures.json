@@ -1,0 +1,47 @@
+[
+  {
+    "width": 50,
+    "height": 50,
+    "seed": 1,
+    "mode": "rgb_lsb",
+    "first_16_bytes": "c67e81ff4bfbe2ff54f6bdff7c1ce1ff",
+    "inner_hash": "b07f3275c0d99bde47cea088825bf389cae25aeb18e9872d89b9d2d8cedae401",
+    "border_hash": "7573c87dadf48bb7bab85e54e31f185193a788fc45e7e2f7d3612e9c1f34eba1"
+  },
+  {
+    "width": 100,
+    "height": 100,
+    "seed": 2,
+    "mode": "rgb_lsb",
+    "first_16_bytes": "8c21ffffedd718ff4e1395ffdc1b63ff",
+    "inner_hash": "b092bb204e8233b850e58535445e9dc76aa3214965c755571fdb0381a83d9fdc",
+    "border_hash": "e2c50eae603da287429a5f017326e87342fa5e8936ede97a049cab5b7e21e3d6"
+  },
+  {
+    "width": 143,
+    "height": 143,
+    "seed": 3,
+    "mode": "b_only",
+    "first_16_bytes": "53c37dff8eb44dff482f6dff3d19e5ff",
+    "inner_hash": "6b9bf53c671cbe79095bbf666024ee267752f5ff449c52f86841c779ccf3442f",
+    "border_hash": "f855b0590a73bf2d0a72c641bb9751bc320f10c89184553bf5f112b5d07db574"
+  },
+  {
+    "width": 400,
+    "height": 400,
+    "seed": 4,
+    "mode": "b_only",
+    "first_16_bytes": "1966fbff2f9082ff424b45ff9d1767ff",
+    "inner_hash": "5ee441d75882ef3d1f3fee97e4c95777949a7148f083925719c209f30782a800",
+    "border_hash": "e37095809b8624c8c1819d912984df905301dca8769d00ba1241a913fc95a4bc"
+  },
+  {
+    "width": 1024,
+    "height": 768,
+    "seed": 5,
+    "mode": "b_only",
+    "first_16_bytes": "df0978ffd16cb8ff3c681dfffd15e9ff",
+    "inner_hash": "1dc7d4f9e4ad05527d7894f807292d0125b36b6016f9aaf4fa22f0294472f0eb",
+    "border_hash": "49e57c732448f42220e3e7776505c3b547762bb7425c10f41bde7f9ae0296ac9"
+  }
+]

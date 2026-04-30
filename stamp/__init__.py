@@ -1,0 +1,15 @@
+from .common import (
+    MAGIC_BYTES,
+    OFFSET_MAGIC,
+    OFFSET_VERSION,
+    OFFSET_SALT_ID,
+    OFFSET_LENGTH,
+    OFFSET_TIMESTAMP,
+    OFFSET_WIDTH,
+    OFFSET_HEIGHT,
+    OFFSET_FINAL_HASH,
+    META_LENGTH,
+    PAYLOAD_LENGTH,
+    HASH_LENGTH,
+)
+from . import v2
