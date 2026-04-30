@@ -172,6 +172,8 @@ async def process_image(file: UploadFile = File(...), upload_type: str = "F"):
             raise HTTPException(status_code=400, detail="empty_file")
         try:
             image = Image.open(BytesIO(content))
+            if hasattr(image, 'n_frames') and image.n_frames > 1:
+                image.seek(0)
         except Exception:
             raise HTTPException(status_code=400, detail="invalid_image")
         try:
