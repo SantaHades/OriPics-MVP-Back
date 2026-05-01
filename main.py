@@ -18,8 +18,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from supabase import create_client
 
+from typing import Optional
+
 from stamp import v2 as stamp_v2
-from stamp.common import META_LENGTH, UPLOAD_TYPE_PREFIXES
+from stamp import v3 as stamp_v3
+from stamp.common import META_LENGTH, META_LENGTH_V3, OFFSET_VERSION, UPLOAD_TYPE_PREFIXES
 
 app = FastAPI(title="OriPics MVP Backend v2")
 
@@ -129,6 +132,8 @@ class SignRequest(BaseModel):
     width: int = Field(gt=0, lt=2**32)
     height: int = Field(gt=0, lt=2**32)
     upload_type: str = "F"
+    lat_e6: Optional[int] = None
+    lng_e6: Optional[int] = None
 
     @field_validator("upload_type")
     @classmethod
@@ -149,8 +154,9 @@ class VerifyRequest(BaseModel):
     @field_validator("meta_hex")
     @classmethod
     def validate_meta_hex(cls, v: str) -> str:
-        if len(v) != META_LENGTH * 2:
-            raise ValueError(f"meta_hex must be {META_LENGTH * 2} hex chars")
+        allowed = (META_LENGTH * 2, META_LENGTH_V3 * 2)
+        if len(v) not in allowed:
+            raise ValueError(f"meta_hex must be {allowed[0]} or {allowed[1]} hex chars, got {len(v)}")
         bytes.fromhex(v)
         return v.lower()
 
@@ -206,14 +212,35 @@ async def sign(req: SignRequest):
     salt_id = CURRENT_SALT_ID
     salt = get_salt(salt_id)
 
-    timestamp_str = stamp_v2.make_timestamp(req.upload_type)
-    meta_bytes = stamp_v2.build_meta_bytes(salt_id, timestamp_str, req.width, req.height)
-    final_hash = stamp_v2.compute_final_hash(
-        salt,
-        meta_bytes,
-        bytes.fromhex(req.inner_hash),
-        bytes.fromhex(req.border_hash),
+    use_v3 = (
+        req.upload_type == "P"
+        and req.lat_e6 is not None
+        and req.lng_e6 is not None
+        and req.width >= 300
+        and req.height >= 300
     )
+
+    timestamp_str = stamp_v2.make_timestamp(req.upload_type)
+    if use_v3:
+        meta_bytes = stamp_v3.build_meta_bytes_v3(
+            salt_id, timestamp_str, req.width, req.height, req.lat_e6, req.lng_e6
+        )
+        final_hash = stamp_v3.compute_final_hash_v3(
+            salt,
+            meta_bytes,
+            bytes.fromhex(req.inner_hash),
+            bytes.fromhex(req.border_hash),
+        )
+        version_num = 3
+    else:
+        meta_bytes = stamp_v2.build_meta_bytes(salt_id, timestamp_str, req.width, req.height)
+        final_hash = stamp_v2.compute_final_hash(
+            salt,
+            meta_bytes,
+            bytes.fromhex(req.inner_hash),
+            bytes.fromhex(req.border_hash),
+        )
+        version_num = 2
 
     link_id, now = make_link_id(req.upload_type)
     path = storage_path_for(link_id, now)
@@ -228,7 +255,7 @@ async def sign(req: SignRequest):
     token = issue_jwt(link_id, path, timestamp_str)
 
     return {
-        "version": CURRENT_VERSION,
+        "version": version_num,
         "salt_id": salt_id,
         "timestamp": timestamp_str,
         "meta_hex": meta_bytes.hex(),
@@ -273,6 +300,38 @@ async def confirm(req: ConfirmRequest):
 @app.post("/api/verify")
 async def verify(req: VerifyRequest):
     meta_bytes = bytes.fromhex(req.meta_hex)
+    version = int.from_bytes(meta_bytes[OFFSET_VERSION:OFFSET_VERSION + 2], "big")
+
+    if version == 3:
+        try:
+            parsed = stamp_v3.parse_meta_bytes_v3(meta_bytes)
+        except ValueError as e:
+            return {"match": False, "reason": str(e)}
+
+        try:
+            salt = get_salt(parsed["salt_id"])
+        except HTTPException as e:
+            return {"match": False, "reason": e.detail}
+
+        match = stamp_v3.verify_final_hash_v3(
+            salt,
+            meta_bytes,
+            bytes.fromhex(req.inner_hash),
+            bytes.fromhex(req.border_hash),
+            bytes.fromhex(req.extracted_final_hash),
+        )
+        return {
+            "match": match,
+            "version": parsed["version"],
+            "metadata": {
+                "timestamp": parsed["timestamp"],
+                "width": parsed["width"],
+                "height": parsed["height"],
+                "lat": parsed["lat_e6"] / 1_000_000,
+                "lng": parsed["lng_e6"] / 1_000_000,
+            },
+        }
+
     try:
         parsed = stamp_v2.parse_meta_bytes(meta_bytes)
     except ValueError as e:
@@ -290,7 +349,6 @@ async def verify(req: VerifyRequest):
         bytes.fromhex(req.border_hash),
         bytes.fromhex(req.extracted_final_hash),
     )
-
     return {
         "match": match,
         "version": parsed["version"],
